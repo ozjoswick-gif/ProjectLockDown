@@ -137,9 +137,14 @@ class CryptoUtils:
         return secrets.token_hex(bytes_len)
 
     @staticmethod
-    def password_to_key(password: str) -> bytes:
-        """Derive 32-byte key from password using SHA-256."""
-        return hashlib.sha256(password.encode("utf-8")).digest()
+    def generate_kdf_salt() -> bytes:
+        """Generate a random 32-byte salt for key derivation."""
+        return get_random_bytes(32)
+
+    @staticmethod
+    def password_to_key(password: str, salt: bytes) -> bytes:
+        """Derive 32-byte key from password using PBKDF2-HMAC-SHA256 (100k iterations)."""
+        return hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 100_000)
 
 
 class SafetyChecker:
@@ -182,6 +187,16 @@ class FileEncryptor:
         self.config = config
         self.safety = SafetyChecker()
         self.stats = {'success': 0, 'failed': 0, 'skipped': 0}
+
+    @staticmethod
+    def secure_delete(path: Path) -> None:
+        """Overwrite file with random bytes then unlink."""
+        size = path.stat().st_size
+        with open(path, 'r+b') as f:
+            f.write(get_random_bytes(size))
+            f.flush()
+            os.fsync(f.fileno())
+        path.unlink()
 
     def encrypt_file(self, file_path: Path, output_path: Optional[Path] = None) -> Path:
         """
@@ -234,12 +249,12 @@ class FileEncryptor:
                 temp_path.unlink()
             raise EncryptionError(f"Cannot write encrypted file: {e}")
 
-        # Delete original if requested
+        # Securely delete original if requested
         if self.config.delete_original:
             try:
-                file_path.unlink()
+                self.secure_delete(file_path)
             except (IOError, OSError) as e:
-                logger.warning(f"Could not delete original {file_path}: {e}")
+                logger.warning(f"Could not securely delete original {file_path}: {e}")
 
         return output_path
 
@@ -297,12 +312,12 @@ class FileEncryptor:
                 temp_path.unlink()
             raise DecryptionError(f"Cannot write decrypted file: {e}")
 
-        # Delete encrypted if requested
+        # Securely delete encrypted file if requested
         if self.config.delete_original:
             try:
-                enc_path.unlink()
+                self.secure_delete(enc_path)
             except (IOError, OSError) as e:
-                logger.warning(f"Could not delete encrypted file {enc_path}: {e}")
+                logger.warning(f"Could not securely delete encrypted file {enc_path}: {e}")
 
         return output_path
 
@@ -462,6 +477,8 @@ class StandardizeManager:
         APP_DIR.mkdir(parents=True, exist_ok=True)
         self.marks: List[MarkedPath] = []
         self.master_hash: Optional[str] = None
+        self.kdf_salt: Optional[bytes] = None
+        self.master_salt: Optional[bytes] = None
         self._load_data()
 
     def _load_data(self):
@@ -477,10 +494,23 @@ class StandardizeManager:
 
         if MASTER_KEY_FILE.exists():
             try:
-                self.master_hash = MASTER_KEY_FILE.read_text().strip()
-            except IOError as e:
+                content = MASTER_KEY_FILE.read_text().strip()
+                parts = content.split(':')
+                if len(parts) == 3:
+                    self.master_hash = parts[0]
+                    self.kdf_salt = bytes.fromhex(parts[1])
+                    self.master_salt = bytes.fromhex(parts[2])
+                else:
+                    # Legacy format — force re-setup
+                    self.master_hash = None
+                    self.kdf_salt = None
+                    self.master_salt = None
+                    logger.warning("Master key file is in legacy format. Please reset your master password.")
+            except (IOError, ValueError) as e:
                 logger.warning(f"Could not load master key: {e}")
                 self.master_hash = None
+                self.kdf_salt = None
+                self.master_salt = None
 
     def _save_data(self):
         """Save marks and master password hash to disk."""
@@ -492,9 +522,11 @@ class StandardizeManager:
         except IOError as e:
             logger.error(f"Could not save marks: {e}")
 
-        if self.master_hash:
+        if self.master_hash and self.kdf_salt and self.master_salt:
             try:
-                MASTER_KEY_FILE.write_text(self.master_hash)
+                MASTER_KEY_FILE.write_text(
+                    f"{self.master_hash}:{self.kdf_salt.hex()}:{self.master_salt.hex()}"
+                )
                 MASTER_KEY_FILE.chmod(0o600)  # Restrict permissions
             except IOError as e:
                 logger.error(f"Could not save master key: {e}")
@@ -507,22 +539,31 @@ class StandardizeManager:
         """Set master password (only if not already set)."""
         if self.has_master_password():
             return False
-        self.master_hash = hashlib.sha256(password.encode()).hexdigest()
+        self.kdf_salt = CryptoUtils.generate_kdf_salt()
+        self.master_salt = CryptoUtils.generate_kdf_salt()
+        self.master_hash = hashlib.pbkdf2_hmac(
+            'sha256', password.encode('utf-8'), self.master_salt, 100_000
+        ).hex()
         self._save_data()
         return True
 
     def verify_master_password(self, password: str) -> bool:
         """Verify master password."""
-        if not self.has_master_password():
+        if not self.has_master_password() or self.master_salt is None:
             return False
-        attempt_hash = hashlib.sha256(password.encode()).hexdigest()
+        attempt_hash = hashlib.pbkdf2_hmac(
+            'sha256', password.encode('utf-8'), self.master_salt, 100_000
+        ).hex()
         return attempt_hash == self.master_hash
 
     def change_master_password(self, old_password: str, new_password: str) -> bool:
         """Change master password."""
         if not self.verify_master_password(old_password):
             return False
-        self.master_hash = hashlib.sha256(new_password.encode()).hexdigest()
+        self.master_salt = CryptoUtils.generate_kdf_salt()
+        self.master_hash = hashlib.pbkdf2_hmac(
+            'sha256', new_password.encode('utf-8'), self.master_salt, 100_000
+        ).hex()
         self._save_data()
         return True
 
@@ -585,6 +626,10 @@ class StandardizeManager:
                 return mark.is_locked
         return None
 
+    def get_kdf_salt(self) -> Optional[bytes]:
+        """Return the stored KDF salt for password-based key derivation."""
+        return self.kdf_salt
+
 
 def get_key(method: KeyMethod, prompt_hex: bool = False) -> bytes:
     """
@@ -606,7 +651,7 @@ def get_key(method: KeyMethod, prompt_hex: bool = False) -> bytes:
         ))
         return CryptoUtils.hex_key_to_bytes(hex_key)
 
-    elif method == KeyMethod.HEX or prompt_hex:
+    elif method == KeyMethod.HEX:
         hex_key = click.prompt("Enter hex key", hide_input=True)
         try:
             return CryptoUtils.hex_key_to_bytes(hex_key)
@@ -614,8 +659,24 @@ def get_key(method: KeyMethod, prompt_hex: bool = False) -> bytes:
             raise click.BadParameter(str(e))
 
     elif method == KeyMethod.PASSWORD:
-        password = click.prompt("Enter password", hide_input=True, confirmation_prompt=True)
-        return CryptoUtils.password_to_key(password)
+        if prompt_hex:
+            # Decryption: need existing salt
+            password = click.prompt("Enter password", hide_input=True)
+            salt_hex = click.prompt("Enter KDF salt (shown during encryption)")
+            try:
+                salt = bytes.fromhex(salt_hex)
+            except ValueError as e:
+                raise click.BadParameter(f"Invalid KDF salt hex: {e}")
+        else:
+            # Encryption: generate new salt
+            password = click.prompt("Enter password", hide_input=True, confirmation_prompt=True)
+            salt = CryptoUtils.generate_kdf_salt()
+            console.print(Panel(
+                Text(f"KDF Salt (required for decryption — save this!):\n{salt.hex()}", style="bold yellow"),
+                title="KDF Salt",
+                border_style="yellow"
+            ))
+        return CryptoUtils.password_to_key(password, salt)
 
     else:
         raise ValueError(f"Unknown key method: {method}")
@@ -652,7 +713,7 @@ def interactive_menu():
     if mode == "Decryption":
         console.print("\n[cyan]Key input method:[/cyan]")
         console.print("  [1] Hex key")
-        console.print("  [2] Password → SHA-256")
+        console.print("  [2] Password → PBKDF2")
         method = None
         while method not in ("1", "2"):
             method = console.input("[bold]> [/bold]").strip()
@@ -662,7 +723,14 @@ def interactive_menu():
         else:
             import getpass
             pwd = getpass.getpass("Enter password: ").strip()
-            key_hex = hashlib.sha256(pwd.encode("utf-8")).hexdigest()
+            salt_hex = console.input("Enter KDF salt (shown during encryption): ").strip()
+            try:
+                salt = bytes.fromhex(salt_hex)
+            except ValueError:
+                console.print("[red]Invalid KDF salt hex.[/red]")
+                return
+            key_bytes_direct = CryptoUtils.password_to_key(pwd, salt)
+            key_hex = key_bytes_direct.hex()
             console.print("[dim]Derived key from password.[/dim]")
     else:
         console.print("\n[cyan]Key input method:[/cyan]")
@@ -684,8 +752,14 @@ def interactive_menu():
         else:
             import getpass
             pwd = getpass.getpass("Enter password: ").strip()
-            key_hex = hashlib.sha256(pwd.encode("utf-8")).hexdigest()
-            console.print("[dim]Derived key from password.[/dim]")
+            salt = CryptoUtils.generate_kdf_salt()
+            key_bytes_direct = CryptoUtils.password_to_key(pwd, salt)
+            key_hex = key_bytes_direct.hex()
+            console.print(Panel(
+                Text(f"KDF Salt (required for decryption — save this!):\n{salt.hex()}", style="bold yellow"),
+                title="KDF Salt",
+                border_style="yellow"
+            ))
 
     try:
         key_bytes = CryptoUtils.hex_key_to_bytes(key_hex)
@@ -862,8 +936,19 @@ def _toggle_encrypt_decrypt_interactive(manager: StandardizeManager):
 
 def _encrypt_marks_interactive(manager: StandardizeManager, marks: List[MarkedPath]):
     """Encrypt all unlocked marked paths (interactive version)."""
-    # Generate a single key for all
-    key = CryptoUtils.password_to_key(secrets.token_hex(32))
+    import getpass
+    password = getpass.getpass("Enter master password to lock: ")
+
+    if not manager.verify_master_password(password):
+        console.print("[red]✗[/red] Incorrect master password!")
+        return
+
+    kdf_salt = manager.get_kdf_salt()
+    if kdf_salt is None:
+        console.print("[red]✗[/red] No KDF salt found. Please reset your master password.")
+        return
+
+    key = CryptoUtils.password_to_key(password, kdf_salt)
     config = CryptoConfig(key, delete_original=True)
     encryptor = FileEncryptor(config)
 
@@ -900,7 +985,12 @@ def _decrypt_marks_interactive(manager: StandardizeManager, marks: List[MarkedPa
         console.print("[red]✗[/red] Incorrect master password!")
         return
 
-    key = CryptoUtils.password_to_key(password)
+    kdf_salt = manager.get_kdf_salt()
+    if kdf_salt is None:
+        console.print("[red]✗[/red] No KDF salt found. Please reset your master password.")
+        return
+
+    key = CryptoUtils.password_to_key(password, kdf_salt)
     config = CryptoConfig(key, delete_original=True)
     encryptor = FileEncryptor(config)
 
@@ -1099,15 +1189,16 @@ def decrypt(path: Path, key_method: str, delete_encrypted: bool):
 
 
 @cli.command()
-@click.option('--length', '-l', default=32,
-              type=click.Choice([16, 24, 32], case_sensitive=False),
+@click.option('--length', '-l', default='32',
+              type=click.Choice(['16', '24', '32']),
               help="Key length in bytes (AES-128/192/256)")
-def generate_key(length: int):
+def generate_key(length: str):
     """Generate a random encryption key."""
-    hex_key = CryptoUtils.generate_hex_key(length)
+    length_int = int(length)
+    hex_key = CryptoUtils.generate_hex_key(length_int)
     console.print(Panel(
         Text(f"{hex_key}", style="bold cyan"),
-        title=f"🔐 AES-{length*8} Key",
+        title=f"🔐 AES-{length_int * 8} Key",
         subtitle="Save this securely - it cannot be recovered!",
         border_style="cyan"
     ))
